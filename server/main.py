@@ -132,7 +132,40 @@ DEFAULT_CONFIG = {
 }
 
 
+def _ensure_pgvector_extension() -> None:
+    """Idempotently enable pgvector before mem0 instantiates its vector store.
+
+    Closes the operator step of running `CREATE EXTENSION vector` by hand on
+    the target Postgres. Failures are logged, not raised — if the extension
+    truly cannot be created, mem0's Memory.from_config() will surface a more
+    specific error a moment later (which is the more useful signal anyway).
+    """
+    import psycopg
+    try:
+        with psycopg.connect(
+            host=POSTGRES_HOST,
+            port=int(POSTGRES_PORT),
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            dbname=POSTGRES_DB,
+            connect_timeout=10,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            conn.commit()
+        logging.info("pgvector verified/enabled in database %s", POSTGRES_DB)
+    except psycopg.errors.InsufficientPrivilege:
+        logging.warning(
+            "Could not enable pgvector: insufficient privilege for user %s. "
+            "An operator must run `CREATE EXTENSION vector` once.",
+            POSTGRES_USER,
+        )
+    except Exception as e:
+        logging.warning("Could not pre-enable pgvector (continuing): %s", e)
+
+
 set_session_factory(SessionLocal)
+_ensure_pgvector_extension()
 initialize_state(DEFAULT_CONFIG)
 
 
