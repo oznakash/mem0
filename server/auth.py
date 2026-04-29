@@ -1,3 +1,4 @@
+import logging
 import os
 import secrets
 import uuid
@@ -19,6 +20,20 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 AUTH_DISABLED = os.environ.get("AUTH_DISABLED", "").lower() in {"1", "true", "yes", "on"}
+
+# Auto-generate an ephemeral JWT_SECRET when one isn't provided so the
+# container boots cleanly. The trade-off is that JWT-issued refresh tokens
+# (used by the dashboard login flow) are invalidated whenever the container
+# restarts. Single-tenant deployments that authenticate via the legacy
+# ADMIN_API_KEY are unaffected. Set JWT_SECRET in env for production.
+if not JWT_SECRET and not AUTH_DISABLED:
+    JWT_SECRET = secrets.token_urlsafe(48)
+    os.environ["JWT_SECRET"] = JWT_SECRET
+    logging.warning(
+        "JWT_SECRET was not set; generated an ephemeral one. Dashboard "
+        "refresh tokens will be invalidated on container restart. Set a "
+        "stable JWT_SECRET env var for production: openssl rand -base64 48"
+    )
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
