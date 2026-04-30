@@ -34,6 +34,7 @@ from routers import learnai_compat as learnai_compat_router
 from routers import google_auth as google_auth_router
 from routers import user_state as user_state_router
 from schemas import MessageResponse
+from postgres_history import attach_postgres_history
 from server_state import get_current_config, get_memory_instance, initialize_state, set_session_factory, update_config
 
 load_dotenv()
@@ -210,6 +211,38 @@ set_session_factory(SessionLocal)
 _ensure_pgvector_extension()
 _run_alembic_migrations()
 initialize_state(DEFAULT_CONFIG)
+
+
+def _attach_postgres_history_safely() -> None:
+    """Swap mem0's SQLiteManager for our Postgres-backed history adapter.
+
+    Cloud-Claude (and many others) don't expose persistent volumes, so
+    SQLite at HISTORY_DB_PATH is ephemeral. Postgres (where pgvector
+    already lives) is persistent. After this call, every memory-edit
+    audit-trail row + buffered message lands in mem0_history /
+    mem0_messages instead of the SQLite file.
+
+    Wrapped in try/except so a Postgres outage at boot doesn't break the
+    server — mem0 continues with its SQLite default and we'll retry on
+    the next boot.
+    """
+    try:
+        attach_postgres_history(
+            get_memory_instance(),
+            host=POSTGRES_HOST,
+            port=int(POSTGRES_PORT),
+            dbname=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+        )
+    except Exception as e:
+        logging.warning(
+            "Could not attach PostgresHistoryManager (continuing with SQLite default): %s",
+            e,
+        )
+
+
+_attach_postgres_history_safely()
 
 
 app = FastAPI(
@@ -403,6 +436,10 @@ def set_config(config: Dict[str, Any], _auth=Depends(verify_auth)):
     """Set memory configuration."""
     _validate_bundled_providers(config)
     update_config(config)
+    # update_config() re-instantiates Memory, which re-instantiates a fresh
+    # SQLiteManager. Re-attach our Postgres adapter so history keeps flowing
+    # to Postgres instead of regressing to the ephemeral file.
+    _attach_postgres_history_safely()
     return {"message": "Configuration set successfully"}
 
 
