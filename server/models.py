@@ -1,7 +1,9 @@
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db import Base
@@ -67,6 +69,28 @@ class Settings(Base):
 
     key: Mapped[str] = mapped_column(String(255), primary_key=True)
     value: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        onupdate=_utcnow,
+    )
+
+
+class UserState(Base):
+    """Single per-user JSON blob holding the SPA's PlayerState.
+
+    Keyed on email. One row per user. The blob is opaque to the server —
+    the SPA decides its shape — so server-side schema changes don't
+    require a coordinated client release. Size is loosely capped at
+    256 KB by the router; bigger blobs are rejected with 413.
+    """
+
+    __tablename__ = "user_states"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=_new_uuid)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    blob: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=_utcnow,

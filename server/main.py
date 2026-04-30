@@ -32,6 +32,7 @@ from routers import entities as entities_router
 from routers import requests as requests_router
 from routers import learnai_compat as learnai_compat_router
 from routers import google_auth as google_auth_router
+from routers import user_state as user_state_router
 from schemas import MessageResponse
 from server_state import get_current_config, get_memory_instance, initialize_state, set_session_factory, update_config
 
@@ -108,7 +109,12 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
 POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
+# `/app/data/history.db` is intentionally the default: operators on
+# Cloud-Claude / Fly / Docker can mount a persistent volume at /app/data
+# and the memory-history audit trail survives rebuilds. Setting
+# HISTORY_DB_PATH=/tmp/history.db (the historical default) makes the
+# audit trail ephemeral — fine for dev, lossy for production.
+HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/data/history.db")
 # mem0's SQLiteManager opens HISTORY_DB_PATH directly via sqlite3.connect, which
 # does not create missing parent directories. Slim Python container images won't
 # have /app/history/ pre-created, so on a fresh deploy the import-time
@@ -244,6 +250,7 @@ app.include_router(entities_router.router)
 app.include_router(requests_router.router)
 app.include_router(learnai_compat_router.router)
 app.include_router(google_auth_router.router)
+app.include_router(user_state_router.router)
 
 
 class Message(BaseModel):
