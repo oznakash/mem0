@@ -21,6 +21,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from auth import (
+    GOOGLE_OAUTH_CLIENT_ID,
+    SESSION_TTL_DAYS,
     is_admin_email,
     issue_session_token,
     verify_auth,
@@ -29,6 +31,39 @@ from auth import (
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+class PublicConfigResponse(BaseModel):
+    """Public, unauth'd handshake values the SPA needs to bootstrap sign-in.
+
+    Only operator-set public values are exposed here. No secrets, no
+    user data, no admin-only fields. The point is: a fresh-localStorage
+    visitor (new device, cleared cookies) can fetch this and self-heal,
+    instead of having to paste a Client ID by hand.
+    """
+    google_client_id: str
+    session_ttl_days: int
+
+
+@router.get(
+    "/config",
+    response_model=PublicConfigResponse,
+    summary="Public sign-in handshake — Google Client ID + session TTL",
+)
+def get_public_config():
+    """Return the public OAuth + session config. Unauthenticated by design.
+
+    Exposes:
+      - GOOGLE_OAUTH_CLIENT_ID (already a public OAuth client ID)
+      - SESSION_TTL_DAYS       (server-side default, used to mint sessions)
+
+    The mem0 admin key, JWT_SECRET, OpenAI key, and database creds are
+    never returned here. Adding fields requires a deliberate review.
+    """
+    return PublicConfigResponse(
+        google_client_id=GOOGLE_OAUTH_CLIENT_ID,
+        session_ttl_days=SESSION_TTL_DAYS,
+    )
 
 
 class GoogleSignInRequest(BaseModel):
