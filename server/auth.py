@@ -163,8 +163,17 @@ async def verify_auth(
     x_api_key: str | None = Depends(api_key_header),
     db: Session = Depends(get_db),
 ) -> User | None:
-    """Authenticate via JWT, X-API-Key, or legacy ADMIN_API_KEY. Returns User or None."""
+    """Authenticate via JWT, X-API-Key, or legacy ADMIN_API_KEY. Returns User or None.
+
+    Bearer credentials are first checked against ADMIN_API_KEY (constant-time compare)
+    so older clients like LearnAI, which present the static admin key as
+    `Authorization: Bearer <key>` rather than `X-API-Key: <key>`, are accepted on
+    the legacy admin path. If no match, the credential is treated as a JWT.
+    """
     if credentials is not None:
+        if ADMIN_API_KEY and secrets.compare_digest(credentials.credentials, ADMIN_API_KEY):
+            _mark_auth_type(request, "admin_api_key")
+            return None
         _mark_auth_type(request, "bearer")
         return _resolve_user_from_jwt(credentials.credentials, db)
 
