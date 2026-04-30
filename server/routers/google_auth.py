@@ -15,13 +15,17 @@ The Gmail-only restriction matches the SPA's existing policy. Admin status
 is read from the ADMIN_EMAILS env var (comma-separated allowlist).
 """
 
-from typing import Optional
+import os
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from auth import (
+    ADMIN_API_KEY,
+    ADMIN_EMAILS,
     GOOGLE_OAUTH_CLIENT_ID,
+    JWT_SECRET,
     SESSION_TTL_DAYS,
     is_admin_email,
     issue_session_token,
@@ -154,6 +158,59 @@ def get_session(request: Request, _auth=Depends(verify_auth)):
         return SessionResponse(is_admin=True, auth_type="admin_api_key")
 
     return SessionResponse(is_admin=False, auth_type=auth_type)
+
+
+class AdminServerStatusResponse(BaseModel):
+    """Operator-only view of which env-driven knobs are configured on the
+    server. Only booleans + non-secret lists are exposed — never secret
+    values. Renders in the LearnAI Admin → Memory tab as a sanity check.
+    """
+    google_oauth_client_id: str
+    admin_emails: List[str]
+    cors_origins: List[str]
+    session_ttl_days: int
+    history_db_path: str
+    openai_api_key_set: bool
+    jwt_secret_set: bool
+    admin_api_key_set: bool
+
+
+@router.get(
+    "/admin/status",
+    response_model=AdminServerStatusResponse,
+    summary="Server config snapshot (admin-only)",
+)
+def get_admin_status(request: Request, _auth=Depends(verify_auth)):
+    """Surface env-driven config state to authenticated admins.
+
+    Authorisation:
+      * google_session JWT with `is_admin: true` claim → allowed
+      * admin_api_key bearer (operator break-glass)             → allowed
+      * anything else                                            → 403
+
+    Booleans only for secrets (OpenAI / JWT_SECRET / ADMIN_API_KEY) so
+    operators can verify they're set without ever transmitting the values.
+    """
+    auth_type = getattr(request.state, "auth_type", "none")
+    session_user = getattr(request.state, "session_user", None) or {}
+    is_admin = (
+        auth_type == "admin_api_key"
+        or (auth_type == "google_session" and bool(session_user.get("is_admin")))
+    )
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin-only endpoint.")
+
+    cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+    return AdminServerStatusResponse(
+        google_oauth_client_id=GOOGLE_OAUTH_CLIENT_ID,
+        admin_emails=list(ADMIN_EMAILS),
+        cors_origins=cors_origins,
+        session_ttl_days=SESSION_TTL_DAYS,
+        history_db_path=os.environ.get("HISTORY_DB_PATH", "/app/data/history.db"),
+        openai_api_key_set=bool(os.environ.get("OPENAI_API_KEY")),
+        jwt_secret_set=bool(JWT_SECRET),
+        admin_api_key_set=bool(ADMIN_API_KEY),
+    )
 
 
 class SignOutResponse(BaseModel):
