@@ -107,6 +107,18 @@ POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
+# mem0's SQLiteManager opens HISTORY_DB_PATH directly via sqlite3.connect, which
+# does not create missing parent directories. Slim Python container images won't
+# have /app/history/ pre-created, so on a fresh deploy the import-time
+# Memory.from_config() call crashes with `unable to open database file`.
+# Idempotently create the parent dir here so the first boot succeeds without
+# requiring a volume mount or a custom Dockerfile mkdir step.
+_history_dir = os.path.dirname(HISTORY_DB_PATH)
+if _history_dir:
+    try:
+        os.makedirs(_history_dir, exist_ok=True)
+    except OSError as e:
+        logging.warning("Could not create history DB parent directory %s: %s", _history_dir, e)
 DEFAULT_LLM_MODEL = os.environ.get("MEM0_DEFAULT_LLM_MODEL", "gpt-4.1-nano-2025-04-14")
 DEFAULT_EMBEDDER_MODEL = os.environ.get("MEM0_DEFAULT_EMBEDDER_MODEL", "text-embedding-3-small")
 
@@ -132,7 +144,40 @@ DEFAULT_CONFIG = {
 }
 
 
+def _ensure_pgvector_extension() -> None:
+    """Idempotently enable pgvector before mem0 instantiates its vector store.
+
+    Closes the operator step of running `CREATE EXTENSION vector` by hand on
+    the target Postgres. Failures are logged, not raised — if the extension
+    truly cannot be created, mem0's Memory.from_config() will surface a more
+    specific error a moment later (which is the more useful signal anyway).
+    """
+    import psycopg
+    try:
+        with psycopg.connect(
+            host=POSTGRES_HOST,
+            port=int(POSTGRES_PORT),
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            dbname=POSTGRES_DB,
+            connect_timeout=10,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            conn.commit()
+        logging.info("pgvector verified/enabled in database %s", POSTGRES_DB)
+    except psycopg.errors.InsufficientPrivilege:
+        logging.warning(
+            "Could not enable pgvector: insufficient privilege for user %s. "
+            "An operator must run `CREATE EXTENSION vector` once.",
+            POSTGRES_USER,
+        )
+    except Exception as e:
+        logging.warning("Could not pre-enable pgvector (continuing): %s", e)
+
+
 set_session_factory(SessionLocal)
+_ensure_pgvector_extension()
 initialize_state(DEFAULT_CONFIG)
 
 
