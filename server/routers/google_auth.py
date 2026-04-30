@@ -82,7 +82,7 @@ def sign_in_with_google(req: GoogleSignInRequest):
     )
 
 
-class MeResponse(BaseModel):
+class SessionResponse(BaseModel):
     email: Optional[str] = None
     name: Optional[str] = None
     picture: Optional[str] = None
@@ -91,19 +91,22 @@ class MeResponse(BaseModel):
     auth_type: str
 
 
-@router.get("/me", response_model=MeResponse, summary="Get the current session user")
-def get_me(request: Request, _auth=Depends(verify_auth)):
+@router.get("/session", response_model=SessionResponse, summary="Get the current session user")
+def get_session(request: Request, _auth=Depends(verify_auth)):
     """Return the current user, derived from whichever auth credential was presented.
 
     Used by the SPA on app load to validate that the stored session token is
     still good. Returns 401 if no valid credential was presented (verify_auth
     raises before we get here).
+
+    Mounted at /auth/session (not /auth/me) to avoid colliding with the
+    dashboard's existing /auth/me endpoint.
     """
     auth_type = getattr(request.state, "auth_type", "none")
     session_user = getattr(request.state, "session_user", None)
 
     if auth_type == "google_session" and session_user:
-        return MeResponse(
+        return SessionResponse(
             email=session_user.get("email"),
             name=session_user.get("name"),
             picture=session_user.get("picture"),
@@ -113,18 +116,16 @@ def get_me(request: Request, _auth=Depends(verify_auth)):
         )
 
     if auth_type == "admin_api_key":
-        # Operator/break-glass auth — surface as admin without per-user info.
-        return MeResponse(is_admin=True, auth_type="admin_api_key")
+        return SessionResponse(is_admin=True, auth_type="admin_api_key")
 
-    # Dashboard JWT, per-user X-API-Key, AUTH_DISABLED — return generic info.
-    return MeResponse(is_admin=False, auth_type=auth_type)
+    return SessionResponse(is_admin=False, auth_type=auth_type)
 
 
 class SignOutResponse(BaseModel):
     message: str
 
 
-@router.post("/signout", response_model=SignOutResponse, summary="Sign out (client-side)")
+@router.post("/google/signout", response_model=SignOutResponse, summary="Sign out (client-side)")
 def sign_out(_auth=Depends(verify_auth)):
     """Sessions are stateless JWTs — server doesn't track them.
 

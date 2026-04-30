@@ -31,6 +31,7 @@ from routers import api_keys as api_keys_router
 from routers import entities as entities_router
 from routers import requests as requests_router
 from routers import learnai_compat as learnai_compat_router
+from routers import google_auth as google_auth_router
 from schemas import MessageResponse
 from server_state import get_current_config, get_memory_instance, initialize_state, set_session_factory, update_config
 
@@ -220,9 +221,18 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_exception_handler(UpstreamError, upstream_error_handler)
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://localhost:3000")
+# Multi-origin CORS: DASHBOARD_URL plus any comma-separated CORS_ORIGINS
+# (LearnAI SPA + previews + localhost dev). De-dup while preserving order.
+_extra_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+_seen: set[str] = set()
+_cors_allow: list[str] = []
+for _origin in [DASHBOARD_URL, *_extra_origins]:
+    if _origin and _origin not in _seen:
+        _seen.add(_origin)
+        _cors_allow.append(_origin)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[DASHBOARD_URL],
+    allow_origins=_cors_allow,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -233,6 +243,7 @@ app.include_router(api_keys_router.router)
 app.include_router(entities_router.router)
 app.include_router(requests_router.router)
 app.include_router(learnai_compat_router.router)
+app.include_router(google_auth_router.router)
 
 
 class Message(BaseModel):
