@@ -30,6 +30,7 @@ from routers import auth as auth_router
 from routers import api_keys as api_keys_router
 from routers import entities as entities_router
 from routers import requests as requests_router
+from routers import learnai_compat as learnai_compat_router
 from schemas import MessageResponse
 from server_state import get_current_config, get_memory_instance, initialize_state, set_session_factory, update_config
 
@@ -49,7 +50,7 @@ SENSITIVE_CONFIG_KEYS = {
     "secret",
     "token",
 }
-SKIPPED_REQUEST_LOG_PATHS = {"/api/health", "/docs", "/redoc", "/openapi.json"}
+SKIPPED_REQUEST_LOG_PATHS = {"/api/health", "/health", "/docs", "/redoc", "/openapi.json"}
 SKIPPED_REQUEST_LOG_PREFIXES = ("/requests",)
 
 BUNDLED_LLM_PROVIDERS = ("openai", "anthropic", "gemini")
@@ -176,8 +177,31 @@ def _ensure_pgvector_extension() -> None:
         logging.warning("Could not pre-enable pgvector (continuing): %s", e)
 
 
+def _run_alembic_migrations() -> None:
+    """Apply auth/session-table migrations before any request hits the DB.
+
+    Without this, the first request that touches the request-log middleware
+    crashes with `relation "request_logs" does not exist` on a fresh
+    database. The fork's docker-compose runs `alembic upgrade head` before
+    uvicorn; the slim production Dockerfile we ship doesn't, so we do it
+    here in-process. Idempotent — no-op when migrations are already applied.
+    """
+    try:
+        from alembic.config import Config
+        from alembic import command
+        from db import engine
+
+        cfg = Config("/app/alembic.ini")
+        cfg.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
+        command.upgrade(cfg, "head")
+        logging.info("Alembic migrations applied")
+    except Exception as e:
+        logging.warning("Alembic upgrade failed (continuing): %s", e)
+
+
 set_session_factory(SessionLocal)
 _ensure_pgvector_extension()
+_run_alembic_migrations()
 initialize_state(DEFAULT_CONFIG)
 
 
@@ -208,6 +232,7 @@ app.include_router(auth_router.router)
 app.include_router(api_keys_router.router)
 app.include_router(entities_router.router)
 app.include_router(requests_router.router)
+app.include_router(learnai_compat_router.router)
 
 
 class Message(BaseModel):
