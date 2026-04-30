@@ -107,6 +107,18 @@ POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
+# mem0's SQLiteManager opens HISTORY_DB_PATH directly via sqlite3.connect, which
+# does not create missing parent directories. Slim Python container images won't
+# have /app/history/ pre-created, so on a fresh deploy the import-time
+# Memory.from_config() call crashes with `unable to open database file`.
+# Idempotently create the parent dir here so the first boot succeeds without
+# requiring a volume mount or a custom Dockerfile mkdir step.
+_history_dir = os.path.dirname(HISTORY_DB_PATH)
+if _history_dir:
+    try:
+        os.makedirs(_history_dir, exist_ok=True)
+    except OSError as e:
+        logging.warning("Could not create history DB parent directory %s: %s", _history_dir, e)
 DEFAULT_LLM_MODEL = os.environ.get("MEM0_DEFAULT_LLM_MODEL", "gpt-4.1-nano-2025-04-14")
 DEFAULT_EMBEDDER_MODEL = os.environ.get("MEM0_DEFAULT_EMBEDDER_MODEL", "text-embedding-3-small")
 
