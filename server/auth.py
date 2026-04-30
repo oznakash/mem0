@@ -21,6 +21,22 @@ REFRESH_TOKEN_EXPIRE_DAYS = 30
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 AUTH_DISABLED = os.environ.get("AUTH_DISABLED", "").lower() in {"1", "true", "yes", "on"}
 
+# Production sign-in (Phase 2 / docs/server-auth-plan.md):
+# Audience for Google ID token verification.
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+# Comma-separated allowlist of admin emails (case-insensitive). Emails on
+# this list get is_admin=true in their session token claims.
+ADMIN_EMAILS = [
+    e.strip().lower()
+    for e in os.environ.get("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+]
+# Session JWT lifetime, in days.
+try:
+    SESSION_TTL_DAYS = max(1, int(os.environ.get("SESSION_TTL_DAYS", "7")))
+except ValueError:
+    SESSION_TTL_DAYS = 7
+
 # Auto-generate an ephemeral JWT_SECRET when one isn't provided so the
 # container boots cleanly. The trade-off is that JWT-issued refresh tokens
 # (used by the dashboard login flow) are invalidated whenever the container
@@ -117,6 +133,99 @@ def decode_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
 
+# ---------------------------------------------------------------------------
+# Production sign-in (Phase 2 — Google ID token verification + session JWT)
+# ---------------------------------------------------------------------------
+
+
+def verify_google_id_token(id_token_str: str) -> dict:
+    """Verify a Google-signed ID token (JWT) against Google's JWKS.
+
+    Returns the claims dict on success. The audience is GOOGLE_OAUTH_CLIENT_ID,
+    and the issuer is checked by the underlying library. Raises HTTPException
+    (401) on any verification failure or 500 if the server isn't configured.
+
+    The google-auth library caches Google's JWKS internally, so cert lookups
+    don't add per-request latency.
+    """
+    if not GOOGLE_OAUTH_CLIENT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Server-side sign-in is not configured. "
+                "Set GOOGLE_OAUTH_CLIENT_ID env var on the mem0 service."
+            ),
+        )
+    try:
+        # Imported lazily so the module loads even if google-auth isn't yet
+        # installed (e.g., during alembic migrations from older builds).
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+
+        claims = google_id_token.verify_oauth2_token(
+            id_token_str,
+            google_requests.Request(),
+            audience=GOOGLE_OAUTH_CLIENT_ID,
+        )
+        return claims
+    except ValueError as e:
+        # google-auth raises ValueError for any verification failure (bad
+        # signature, expired, wrong audience, untrusted issuer, etc.).
+        raise HTTPException(status_code=401, detail=f"Invalid Google ID token: {e}")
+    except ImportError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"google-auth library not installed: {e}",
+        )
+
+
+def issue_session_token(
+    email: str,
+    name: str | None = None,
+    picture: str | None = None,
+    is_admin: bool = False,
+    ttl_days: int | None = None,
+) -> tuple[str, datetime]:
+    """Mint a session JWT signed with JWT_SECRET. Returns (jwt, expires_at).
+
+    Distinct from create_access_token (used by the dashboard login flow) —
+    sets `type: "session"` so verify_auth can route it to the session path.
+    """
+    days = ttl_days if ttl_days is not None else SESSION_TTL_DAYS
+    expire = datetime.now(timezone.utc) + timedelta(days=days)
+    payload = {
+        "sub": email,
+        "email": email,
+        "name": name,
+        "picture": picture,
+        "is_admin": is_admin,
+        "exp": expire,
+        "type": "session",
+    }
+    token = jwt.encode(payload, _get_secret(), algorithm=JWT_ALGORITHM)
+    return token, expire
+
+
+def decode_session_token(token: str) -> dict | None:
+    """Decode a session JWT. Returns claims dict or None if invalid/expired/wrong-type.
+
+    Returns None (rather than raising) so verify_auth can fall through to the
+    next auth strategy when the token isn't ours.
+    """
+    try:
+        payload = jwt.decode(token, _get_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "session":
+            return None
+        return payload
+    except JWTError:
+        return None
+
+
+def is_admin_email(email: str) -> bool:
+    """Whether an email is on the ADMIN_EMAILS allowlist (case-insensitive)."""
+    return email.lower() in ADMIN_EMAILS
+
+
 bearer_scheme = HTTPBearer(auto_error=False)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -163,17 +272,26 @@ async def verify_auth(
     x_api_key: str | None = Depends(api_key_header),
     db: Session = Depends(get_db),
 ) -> User | None:
-    """Authenticate via JWT, X-API-Key, or legacy ADMIN_API_KEY. Returns User or None.
+    """Authenticate via session JWT, dashboard JWT, X-API-Key, or legacy
+    ADMIN_API_KEY. Returns User or None.
 
-    Bearer credentials are first checked against ADMIN_API_KEY (constant-time compare)
-    so older clients like LearnAI, which present the static admin key as
-    `Authorization: Bearer <key>` rather than `X-API-Key: <key>`, are accepted on
-    the legacy admin path. If no match, the credential is treated as a JWT.
+    Priority for Bearer credentials:
+      1. ADMIN_API_KEY (constant-time compare)        -> auth_type=admin_api_key
+      2. Session JWT (type=session, from /auth/google) -> auth_type=google_session,
+         sets request.state.session_user with claims
+      3. Otherwise treat as access JWT (type=access)   -> auth_type=bearer
     """
     if credentials is not None:
         if ADMIN_API_KEY and secrets.compare_digest(credentials.credentials, ADMIN_API_KEY):
             _mark_auth_type(request, "admin_api_key")
             return None
+
+        session_claims = decode_session_token(credentials.credentials)
+        if session_claims is not None:
+            _mark_auth_type(request, "google_session")
+            request.state.session_user = session_claims
+            return None
+
         _mark_auth_type(request, "bearer")
         return _resolve_user_from_jwt(credentials.credentials, db)
 
@@ -200,9 +318,19 @@ async def require_auth(
     user: User | None = Depends(verify_auth),
     db: Session = Depends(get_db),
 ) -> User:
-    """Like verify_auth but guarantees a non-None User. Use for endpoints that require auth."""
+    """Like verify_auth but guarantees a non-None User. Use for endpoints that require auth.
+
+    For non-DB-backed auth types (admin_api_key, google_session, disabled), falls
+    back to the first/default User in the database. This keeps mem0's existing
+    handlers — which read User attributes — working for callers authenticated
+    via the new Google session path.
+    """
     if user is None:
-        if getattr(request.state, "auth_type", "none") in {"admin_api_key", "disabled"}:
+        if getattr(request.state, "auth_type", "none") in {
+            "admin_api_key",
+            "google_session",
+            "disabled",
+        }:
             default_user = _get_default_user(db)
             if default_user is not None:
                 return default_user
