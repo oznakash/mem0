@@ -24,9 +24,9 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from auth import verify_auth
@@ -121,3 +121,81 @@ def delete_state(request: Request, _auth=Depends(verify_auth), db: Session = Dep
         db.delete(row)
         db.commit()
     return MessageResponse(message="User state wiped.")
+
+
+# -- Admin: cross-user introspection ---------------------------------------
+# user_state is the canonical "real users" table — every Google sign-in
+# that does anything in the SPA writes a row here via the cross-device
+# sync. Admin Analytics in the SPA was previously reading user counts off
+# social-svc, which only sees users who hit the (often-disabled) social
+# pipeline — so a populated platform showed `1 user`. This endpoint is
+# the missing source of truth.
+
+class AdminUserSummary(BaseModel):
+    email: str
+    updated_at: Optional[datetime]
+    xp: int = 0
+    streak: int = 0
+
+
+class AdminUsersResponse(BaseModel):
+    count: int = Field(..., description="Total rows in user_state.")
+    recent: list[AdminUserSummary] = Field(
+        default_factory=list,
+        description="Most-recently-updated users, oldest-first up to `limit`.",
+    )
+
+
+def _require_admin(request: Request) -> None:
+    """Allow admin_api_key OR a Google session JWT with `is_admin=true`.
+
+    Same gate AdminServerStatus uses — keep the two consistent so an
+    operator can switch between break-glass and session auth without
+    surprises. Anything else 403s.
+    """
+    auth_type = getattr(request.state, "auth_type", "none")
+    session_user = getattr(request.state, "session_user", None) or {}
+    is_admin = (
+        auth_type == "admin_api_key"
+        or (auth_type == "google_session" and bool(session_user.get("is_admin")))
+    )
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin-only endpoint.")
+
+
+@router.get(
+    "/state/admin/users",
+    response_model=AdminUsersResponse,
+    summary="List user_state rows (admin-only)",
+)
+def list_user_state(
+    request: Request,
+    _auth=Depends(verify_auth),
+    db: Session = Depends(get_db),
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    _require_admin(request)
+    total = db.scalar(select(func.count()).select_from(UserState)) or 0
+    rows = (
+        db.execute(
+            select(UserState)
+            .order_by(UserState.updated_at.desc().nullslast())
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    recent = [
+        AdminUserSummary(
+            email=r.email,
+            updated_at=r.updated_at,
+            # Best-effort projection of the opaque blob — both fields are
+            # well-known SPA shapes that have been stable since v1. If a
+            # future SPA renames them, the values fall back to 0 instead
+            # of throwing.
+            xp=int((r.blob or {}).get("xp") or 0),
+            streak=int((r.blob or {}).get("streak") or 0),
+        )
+        for r in rows
+    ]
+    return AdminUsersResponse(count=int(total), recent=recent)
