@@ -133,9 +133,30 @@ def delete_state(request: Request, _auth=Depends(verify_auth), db: Session = Dep
 
 class AdminUserSummary(BaseModel):
     email: str
-    updated_at: Optional[datetime]
+    created_at: Optional[datetime] = Field(
+        None,
+        description="Row creation timestamp — proxy for first server-side sync.",
+    )
+    updated_at: Optional[datetime] = Field(
+        None,
+        description="Last server-side write to the blob.",
+    )
+    signup_at: Optional[int] = Field(
+        None,
+        description="`profile.createdAt` from the blob (epoch ms), if present.",
+    )
+    last_seen_at: Optional[int] = Field(
+        None,
+        description="Best-effort last-active hint, derived from blob fields.",
+    )
     xp: int = 0
     streak: int = 0
+    total_sparks: int = Field(0, description="Sum of `history[].sparkIds.length`.")
+    total_minutes: int = Field(0, description="Sum of `history[].minutes`.")
+    activity_14d: list[int] = Field(
+        default_factory=list,
+        description="Sparks per day for the last 14 days, oldest-first.",
+    )
 
 
 class AdminUsersResponse(BaseModel):
@@ -163,6 +184,78 @@ def _require_admin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Admin-only endpoint.")
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return n if n >= 0 else default
+
+
+def _activity_14d_from_history(history: Any, now_ms: int) -> tuple[list[int], int, int]:
+    """Build a (14-day activity, total_sparks, total_minutes) tuple from
+    the blob's `history` array. Mirrors the SPA's own `computeActivity14d`
+    helper so admin charts stay consistent with what the player sees in
+    their own dashboard. Skips malformed entries silently — the blob is
+    opaque to the server and has no schema guarantees."""
+    days: list[int] = [0] * 14
+    total_sparks = 0
+    total_minutes = 0
+    if not isinstance(history, list):
+        return days, total_sparks, total_minutes
+    day_ms = 24 * 60 * 60 * 1000
+    today_start_ms = now_ms - (now_ms % day_ms)
+    for session in history:
+        if not isinstance(session, dict):
+            continue
+        spark_ids = session.get("sparkIds")
+        n_sparks = len(spark_ids) if isinstance(spark_ids, list) else 0
+        total_sparks += n_sparks
+        total_minutes += _safe_int(session.get("minutes"))
+        ts = session.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        offset = round((today_start_ms - (int(ts) - (int(ts) % day_ms))) / day_ms)
+        if 0 <= offset < 14:
+            # index 0 = oldest (13 days ago), 13 = today
+            days[13 - offset] += n_sparks
+    return days, total_sparks, total_minutes
+
+
+def _derive_summary(row: UserState, now_ms: int) -> AdminUserSummary:
+    """Build the admin-shape summary from a UserState row. The blob is
+    opaque, so every field has a fallback; missing keys never raise."""
+    blob = row.blob or {}
+    profile = blob.get("profile") if isinstance(blob.get("profile"), dict) else {}
+    activity, total_sparks, total_minutes = _activity_14d_from_history(
+        blob.get("history"), now_ms
+    )
+    signup_at_raw = profile.get("createdAt") if profile else None
+    signup_at = int(signup_at_raw) if isinstance(signup_at_raw, (int, float)) else None
+    streak_updated = blob.get("streakUpdatedAt")
+    last_seen_at = (
+        int(streak_updated)
+        if isinstance(streak_updated, (int, float)) and streak_updated > 0
+        else (
+            int(row.updated_at.timestamp() * 1000)
+            if row.updated_at is not None
+            else None
+        )
+    )
+    return AdminUserSummary(
+        email=row.email,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        signup_at=signup_at,
+        last_seen_at=last_seen_at,
+        xp=_safe_int(blob.get("xp")),
+        streak=_safe_int(blob.get("streak")),
+        total_sparks=total_sparks,
+        total_minutes=total_minutes,
+        activity_14d=activity,
+    )
+
+
 @router.get(
     "/state/admin/users",
     response_model=AdminUsersResponse,
@@ -185,17 +278,41 @@ def list_user_state(
         .scalars()
         .all()
     )
-    recent = [
-        AdminUserSummary(
-            email=r.email,
-            updated_at=r.updated_at,
-            # Best-effort projection of the opaque blob — both fields are
-            # well-known SPA shapes that have been stable since v1. If a
-            # future SPA renames them, the values fall back to 0 instead
-            # of throwing.
-            xp=int((r.blob or {}).get("xp") or 0),
-            streak=int((r.blob or {}).get("streak") or 0),
-        )
-        for r in rows
-    ]
-    return AdminUsersResponse(count=int(total), recent=recent)
+    now_ms = int(datetime.now().timestamp() * 1000)
+    return AdminUsersResponse(
+        count=int(total),
+        recent=[_derive_summary(r, now_ms) for r in rows],
+    )
+
+
+@router.delete(
+    "/state/admin/users/{email}",
+    response_model=MessageResponse,
+    summary="Wipe a specific user's user_state (admin-only)",
+)
+def admin_wipe_user_state(
+    email: str,
+    request: Request,
+    _auth=Depends(verify_auth),
+    db: Session = Depends(get_db),
+):
+    """Destructive: removes the user_state row for `email`. The user can
+    sign in again afterwards and gets a fresh slate. Used by the LearnAI
+    Admin "Reset progress" action on real users — the SPA-level local
+    `resetUserProgress` only mutates UI state and would silently rebound
+    on the next mem0 fetch, which surfaced as a footgun.
+
+    Same admin gate as `/state/admin/users`. The path-encoded `email` is
+    the recipient — no body, no JWT-binding to the caller. Returns 200
+    with `wiped: false` when the row didn't exist (idempotent), 200 with
+    `wiped: true` when it did."""
+    _require_admin(request)
+    target = (email or "").lower().strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="Email path param is empty.")
+    row = db.scalar(select(UserState).where(UserState.email == target))
+    if row is None:
+        return MessageResponse(message=f"No user_state row for {target}; nothing to wipe.")
+    db.delete(row)
+    db.commit()
+    return MessageResponse(message=f"Wiped user_state for {target}.")
