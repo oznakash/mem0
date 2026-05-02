@@ -157,6 +157,22 @@ class AdminUserSummary(BaseModel):
         default_factory=list,
         description="Sparks per day for the last 14 days, oldest-first.",
     )
+    # Email policy state (written by /v1/email/admin/* endpoints — opaque
+    # blob, no schema migration). Surfaced here so the LearnAI Admin can
+    # render queue badges + decide rate-limit / pause / unsub in one
+    # round-trip.
+    email_unsubscribed_at: Optional[int] = Field(
+        None,
+        description="Epoch ms; when set, all sends to this user are blocked.",
+    )
+    email_pause_until: Optional[int] = Field(
+        None,
+        description="Epoch ms; sends are paused until this time. Set automatically when N consecutive emails go unread.",
+    )
+    email_log: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Last few prepared sends. Each entry: {id, tpl, sent_at, opened_at, is_transactional}.",
+    )
 
 
 class AdminUsersResponse(BaseModel):
@@ -242,6 +258,11 @@ def _derive_summary(row: UserState, now_ms: int) -> AdminUserSummary:
             else None
         )
     )
+    # Email policy fields are written by /v1/email/admin/* endpoints
+    # into the same opaque blob. Surface the most recent few entries —
+    # the LearnAI flushQueue uses the last 2 to decide whether to pause.
+    email_log_raw = blob.get("emailLog") if isinstance(blob.get("emailLog"), list) else []
+    email_log = [e for e in email_log_raw if isinstance(e, dict)][:5]
     return AdminUserSummary(
         email=row.email,
         created_at=row.created_at,
@@ -253,6 +274,9 @@ def _derive_summary(row: UserState, now_ms: int) -> AdminUserSummary:
         total_sparks=total_sparks,
         total_minutes=total_minutes,
         activity_14d=activity,
+        email_unsubscribed_at=blob.get("emailUnsubscribedAt") if isinstance(blob.get("emailUnsubscribedAt"), int) else None,
+        email_pause_until=blob.get("emailPauseUntil") if isinstance(blob.get("emailPauseUntil"), int) else None,
+        email_log=email_log,
     )
 
 
