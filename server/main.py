@@ -284,6 +284,8 @@ app.include_router(requests_router.router)
 app.include_router(learnai_compat_router.router)
 app.include_router(google_auth_router.router)
 app.include_router(user_state_router.router)
+from routers import email as email_router  # noqa: E402
+app.include_router(email_router.router)
 
 
 class Message(BaseModel):
