@@ -181,7 +181,24 @@ def prepare_send(
     if not email:
         raise HTTPException(status_code=400, detail="`to` is required.")
 
-    base_url = str(request.base_url).rstrip("/")
+    # request.base_url respects whatever scheme the inbound request came
+    # in on. Behind Traefik that's plain http between proxy and app —
+    # but emails sent to real recipients must use https. Honor
+    # X-Forwarded-Proto, and let an operator pin a canonical base via
+    # PUBLIC_BASE_URL when the deployment is exotic. Last-resort: silently
+    # upgrade non-localhost http to https since cloud-claude is always
+    # TLS-fronted.
+    pinned = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if pinned:
+        base_url = pinned
+    else:
+        proto = (request.headers.get("x-forwarded-proto") or "").strip().lower()
+        raw = str(request.base_url).rstrip("/")
+        if proto == "https" and raw.startswith("http://"):
+            raw = "https://" + raw[len("http://"):]
+        elif raw.startswith("http://") and "localhost" not in raw and "127.0.0.1" not in raw:
+            raw = "https://" + raw[len("http://"):]
+        base_url = raw
     row = _get_or_create_state(db, email)
     blob = _ensure_blob(row)
     now_ms = int(time.time() * 1000)
