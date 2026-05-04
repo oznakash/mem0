@@ -66,13 +66,16 @@ def test_fanout_runs_on_a_daemon_thread():
 def test_fanout_mints_an_admin_token_using_shared_jwt_secret():
     """social-svc's admin gate accepts a Google session JWT with
     `is_admin=true`. The fan-out must mint that exact shape using
-    JWT_SECRET (the secret both services share)."""
+    JWT_SECRET (the secret both services share). Uses python-jose
+    (matching `auth.py` — adding PyJWT would be a new dependency)."""
     src = _src()
     assert "_mint_admin_session_for_social" in src
     block = src[src.index("def _mint_admin_session_for_social") :]
     assert '"is_admin": True' in block
     assert "JWT_ALGORITHM" in block
     assert '"type": "session"' in block
+    # Mints with jose (already a project dep), not PyJWT.
+    assert "jose_jwt.encode" in block
 
 
 def test_fanout_payload_includes_google_identity():

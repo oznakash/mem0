@@ -24,8 +24,8 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Request
+from jose import jwt as jose_jwt
 from pydantic import BaseModel, Field
 
 from auth import (
@@ -74,7 +74,7 @@ def _mint_admin_session_for_social(email: str) -> str:
         "exp": expire,
         "type": "session",
     }
-    return pyjwt.encode(payload, _get_secret(), algorithm=JWT_ALGORITHM)
+    return jose_jwt.encode(payload, _get_secret(), algorithm=JWT_ALGORITHM)
 
 
 def _ping_social_svc_async(email: str, name: str | None, picture: str | None) -> None:
