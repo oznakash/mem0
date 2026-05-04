@@ -133,6 +133,17 @@ def delete_state(request: Request, _auth=Depends(verify_auth), db: Session = Dep
 
 class AdminUserSummary(BaseModel):
     email: str
+    # Persisted Google identity (NULL when the user signed up via password
+    # — auth.users carries the `name` for those). Updated on every
+    # /auth/google signin; consumed by the social-svc reconcile path.
+    display_name: Optional[str] = Field(
+        None,
+        description="Latest Google `name` claim seen on signin. NULL for password users.",
+    )
+    picture_url: Optional[str] = Field(
+        None,
+        description="Latest Google `picture` claim seen on signin. NULL for password users.",
+    )
     created_at: Optional[datetime] = Field(
         None,
         description="Row creation timestamp — proxy for first server-side sync.",
@@ -265,6 +276,8 @@ def _derive_summary(row: UserState, now_ms: int) -> AdminUserSummary:
     email_log = [e for e in email_log_raw if isinstance(e, dict)][:5]
     return AdminUserSummary(
         email=row.email,
+        display_name=row.display_name,
+        picture_url=row.picture_url,
         created_at=row.created_at,
         updated_at=row.updated_at,
         signup_at=signup_at,
@@ -278,6 +291,67 @@ def _derive_summary(row: UserState, now_ms: int) -> AdminUserSummary:
         email_pause_until=blob.get("emailPauseUntil") if isinstance(blob.get("emailPauseUntil"), int) else None,
         email_log=email_log,
     )
+
+
+# -- Identity persistence on signin -----------------------------------------
+#
+# Called by /auth/google after the session token is minted. Upserts the
+# user's display_name and picture_url onto user_state so social-svc's
+# reconcile path can backfill those fields onto profiles. Idempotent:
+# if the row already exists, only the two identity columns are touched
+# (the blob is left alone). If the row doesn't exist, a stub is created
+# with empty blob and the two identity columns set.
+#
+# Failures are swallowed — the signin flow must never fail because of a
+# write to a side table. Logs at WARN.
+
+import logging
+_identity_log = logging.getLogger("user_state.identity")
+
+
+def upsert_user_identity(
+    db: Session,
+    *,
+    email: str,
+    name: Optional[str],
+    picture_url: Optional[str],
+) -> None:
+    """Best-effort write of the user's Google name + avatar to user_state.
+    Never raises into the caller (which is the signin path). When `name`
+    or `picture_url` is None / empty / whitespace-only, that column is
+    left untouched — preserves whatever the previous signin stored."""
+    try:
+        normalized_email = (email or "").strip().lower()
+        if not normalized_email:
+            return
+        clean_name = (name or "").strip() or None
+        clean_picture = (picture_url or "").strip() or None
+        row = db.scalar(select(UserState).where(UserState.email == normalized_email))
+        if row is None:
+            db.add(
+                UserState(
+                    email=normalized_email,
+                    blob={},
+                    display_name=clean_name,
+                    picture_url=clean_picture,
+                )
+            )
+        else:
+            # Only overwrite when the new claim is non-empty. A user who
+            # later signs in with a missing claim shouldn't blow away the
+            # stored value — Google sometimes omits the picture URL on
+            # cached tokens.
+            if clean_name is not None:
+                row.display_name = clean_name
+            if clean_picture is not None:
+                row.picture_url = clean_picture
+        db.commit()
+    except Exception as exc:
+        _identity_log.warning(
+            "upsert_user_identity_failed",
+            extra={"email_hash": (email or "")[:3], "err": str(exc)},
+        )
+        db.rollback()
 
 
 @router.get(
@@ -312,7 +386,7 @@ def list_user_state(
 @router.delete(
     "/state/admin/users/{email}",
     response_model=MessageResponse,
-    summary="Wipe a specific user's user_state (admin-only)",
+    summary="Reset a user's progress only (admin-only) — wipes user_state",
 )
 def admin_wipe_user_state(
     email: str,
@@ -320,16 +394,16 @@ def admin_wipe_user_state(
     _auth=Depends(verify_auth),
     db: Session = Depends(get_db),
 ):
-    """Destructive: removes the user_state row for `email`. The user can
-    sign in again afterwards and gets a fresh slate. Used by the LearnAI
-    Admin "Reset progress" action on real users — the SPA-level local
-    `resetUserProgress` only mutates UI state and would silently rebound
-    on the next mem0 fetch, which surfaced as a footgun.
+    """**Reset-progress-only** action. Removes the `user_state` row for
+    `email` so the SPA's PlayerState (xp, streak, history, calibration)
+    starts over on the user's next sign-in. Does NOT touch:
 
-    Same admin gate as `/state/admin/users`. The path-encoded `email` is
-    the recipient — no body, no JWT-binding to the caller. Returns 200
-    with `wiped: false` when the row didn't exist (idempotent), 200 with
-    `wiped: true` when it did."""
+      - memories (mem0 vector store) — use `/v1/state/admin/users/{email}/cascade`
+        for a full wipe.
+      - the user's social-svc profile, follow graph, or stream events.
+      - the user's signed-in session (the JWT is stateless).
+
+    Idempotent. Returns 200 + a clear message either way."""
     _require_admin(request)
     target = (email or "").lower().strip()
     if not target:
@@ -339,4 +413,156 @@ def admin_wipe_user_state(
         return MessageResponse(message=f"No user_state row for {target}; nothing to wipe.")
     db.delete(row)
     db.commit()
-    return MessageResponse(message=f"Wiped user_state for {target}.")
+    return MessageResponse(
+        message=f"Reset progress for {target} (user_state row removed). The user's memories, profile, and social graph are intact — use the `cascade` endpoint to fully remove the user."
+    )
+
+
+@router.delete(
+    "/state/admin/users/{email}/cascade",
+    response_model=MessageResponse,
+    summary="Remove a user permanently (admin-only) — cascades across mem0 + social-svc",
+)
+def admin_remove_user_cascade(
+    email: str,
+    request: Request,
+    _auth=Depends(verify_auth),
+    db: Session = Depends(get_db),
+):
+    """**Permanent-removal** action. Wipes EVERY trace of the user
+    across mem0 + social-svc so the user's next sign-in starts a brand-
+    new onboarding flow:
+
+      1. mem0 user_state row (xp, streak, history, calibration).
+      2. mem0 memories — every entry where user_id = email.
+      3. mem0 auth.users row (only present for password-registered users).
+      4. social-svc profile — fanned out via SOCIAL_SVC_URL admin DELETE.
+         Cascades inside social-svc to follows, blocks, reports, events.
+
+    Idempotent: a row that doesn't exist is a no-op for that step.
+
+    The fan-out to social-svc is done synchronously here (not fire-and-
+    forget) so the operator's response reflects the true cross-service
+    state. Failures don't roll back what was already deleted — the
+    response carries a structured `steps` map so the operator sees
+    exactly which deletes succeeded.
+
+    Same admin gate as the rest of /v1/state/admin. After this call,
+    a new sign-in by the same email will trigger a fresh onboarding."""
+    _require_admin(request)
+    target = (email or "").lower().strip()
+    if not target or "@" not in target:
+        raise HTTPException(status_code=400, detail="Invalid email path param.")
+
+    steps: dict[str, Any] = {}
+
+    # Step 1 — user_state row.
+    try:
+        row = db.scalar(select(UserState).where(UserState.email == target))
+        if row is None:
+            steps["user_state"] = "absent"
+        else:
+            db.delete(row)
+            db.commit()
+            steps["user_state"] = "deleted"
+    except Exception as exc:
+        db.rollback()
+        steps["user_state"] = f"error: {exc}"
+
+    # Step 2 — memories (vector store + history).
+    try:
+        from server_state import get_memory_instance
+
+        get_memory_instance().delete_all(filters={"user_id": target})
+        steps["memories"] = "deleted"
+    except Exception as exc:
+        steps["memories"] = f"error: {exc}"
+
+    # Step 3 — auth.users row (only for password users).
+    try:
+        from models import User
+
+        user_row = db.scalar(select(User).where(User.email == target))
+        if user_row is None:
+            steps["auth_users"] = "absent"
+        else:
+            db.delete(user_row)
+            db.commit()
+            steps["auth_users"] = "deleted"
+    except Exception as exc:
+        db.rollback()
+        steps["auth_users"] = f"error: {exc}"
+
+    # Step 4 — social-svc fanout. Reuses the existing
+    # `_ping_social_svc_async` style (admin token + cross-host POST),
+    # but synchronous here so the response reflects the cross-service
+    # state. Skipped when SOCIAL_SVC_URL is unset (same-host setups
+    # share the volume — operator runs the social-svc DELETE separately).
+    try:
+        from routers.google_auth import (
+            SOCIAL_SVC_URL,
+            _mint_admin_session_for_social,
+        )
+        import json
+        import urllib.error
+        import urllib.request
+
+        if not SOCIAL_SVC_URL:
+            steps["social_svc"] = "skipped (SOCIAL_SVC_URL unset)"
+        else:
+            tok = _mint_admin_session_for_social("auth-cascade@learnai")
+            # social-svc deletes by handle; resolve via a quick lookup.
+            # The admin upsert returns { handle, email } when re-called
+            # but we need a lookup-only path. Read /v1/social/admin/profiles
+            # to find the handle for our email.
+            list_req = urllib.request.Request(
+                f"{SOCIAL_SVC_URL}/v1/social/admin/profiles",
+                headers={"Authorization": f"Bearer {tok}"},
+                method="GET",
+            )
+            handle: Optional[str] = None
+            try:
+                with urllib.request.urlopen(list_req, timeout=4.0) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                for p in body.get("profiles", []):
+                    if p.get("emailHash") and p.get("handle"):
+                        # masked email — match by hash. The admin endpoint
+                        # echoes oznakash's email verbatim (admin) and masks
+                        # others — both flows resolve via `emailMasked`
+                        # equality on the original email.
+                        emasked = p.get("emailMasked", "") or ""
+                        if emasked.lower() == target.lower():
+                            handle = p["handle"]
+                            break
+                        # masked form: first 3 chars + ***@<domain>
+                        if "***" in emasked:
+                            local, _, domain = target.partition("@")
+                            if emasked.startswith(local[:3]) and emasked.endswith(f"@{domain}"):
+                                handle = p["handle"]
+                                break
+            except urllib.error.URLError as e:
+                steps["social_svc"] = f"list_error: {e}"
+                handle = None
+
+            if not handle:
+                steps["social_svc"] = "absent_or_unresolvable"
+            else:
+                del_req = urllib.request.Request(
+                    f"{SOCIAL_SVC_URL}/v1/social/admin/profiles/by-handle/{handle}",
+                    headers={"Authorization": f"Bearer {tok}"},
+                    method="DELETE",
+                )
+                try:
+                    with urllib.request.urlopen(del_req, timeout=4.0) as resp:
+                        steps["social_svc"] = f"deleted (handle={handle}, status={resp.getcode()})"
+                except urllib.error.HTTPError as he:
+                    steps["social_svc"] = f"http_error: {he.code}"
+    except Exception as exc:
+        steps["social_svc"] = f"error: {exc}"
+
+    return MessageResponse(
+        message=(
+            f"Cascade-removed {target}. Steps: {steps}. "
+            f"On next sign-in, this email will start fresh onboarding."
+        )
+    )
