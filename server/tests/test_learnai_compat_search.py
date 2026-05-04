@@ -13,77 +13,48 @@ Result on the live service: every memory-search call returned 500
 ("Upstream provider error"). This test pins the fix — entity ids must
 land in `kwargs["filters"]`, never as top-level kwargs.
 
-The fix is in a pure helper `_build_search_kwargs` so we can unit-test
-the translation without dragging in the FastAPI app, sqlalchemy, or
-mem0 itself.
+Implementation note: the fix lives in a pure helper
+`_build_search_kwargs` so the contract is unit-testable without
+dragging in FastAPI / SQLAlchemy / mem0 itself. We extract it via a
+text snippet from the source file rather than `import routers.learnai_compat`
+so this test can't pollute `sys.modules` for the other smoke tests
+running in the same pytest process.
 """
 
 from __future__ import annotations
 
-import importlib
 import os
-import sys
-from types import ModuleType
-from unittest.mock import MagicMock
-
-# Set env vars + sys.path before importing.
-os.environ.setdefault("AUTH_DISABLED", "true")
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+from typing import Any, Callable, Dict
 
 
-def _load_helper():
-    """Import the helper while stubbing its heavy deps so the import
-    works in a minimal venv."""
-    # Stub `auth.verify_auth` (pulled by the router on import)
-    auth_stub = ModuleType("auth")
-    auth_stub.verify_auth = lambda: None  # type: ignore[attr-defined]
-    sys.modules.setdefault("auth", auth_stub)
-    # Stub `mem0_compat.get_memory_instance` if used; the router imports
-    # `mem0_compat` so we provide a minimal module.
-    mem0_compat_stub = ModuleType("mem0_compat")
-    mem0_compat_stub.get_memory_instance = lambda: MagicMock()  # type: ignore[attr-defined]
-    sys.modules.setdefault("mem0_compat", mem0_compat_stub)
-    # Stub `errors`
-    errors_stub = ModuleType("errors")
-
-    class _Up(Exception):
-        pass
-
-    errors_stub.upstream_error = _Up  # type: ignore[attr-defined]
-    sys.modules.setdefault("errors", errors_stub)
-    # Now import the module — but only pull the helper out, ignore the
-    # router-level FastAPI/SQLAlchemy plumbing.
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "_compat_for_test",
-        os.path.join(HERE, "routers", "learnai_compat.py"),
-    )
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    except Exception:
-        # Some module-level imports may fail in the minimal venv. The
-        # helper is still re-exposable via its source — fall back to an
-        # exec of just the helper definition.
-        with open(os.path.join(HERE, "routers", "learnai_compat.py")) as f:
-            src = f.read()
-        # Snip from `def _build_search_kwargs` to the next `def `.
-        start = src.index("def _build_search_kwargs")
-        end = src.index("\n@router", start)
-        snippet = (
-            "from typing import Any, Dict\n" + src[start:end]
+def _extract_helper() -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+    """Slice `_build_search_kwargs` out of the router source and exec
+    it in a fresh namespace. Keeps the test environment minimal — no
+    fastapi, no sqlalchemy, no mem0 needed."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src_path = os.path.join(here, "routers", "learnai_compat.py")
+    with open(src_path, "r", encoding="utf-8") as f:
+        src = f.read()
+    start_marker = "def _build_search_kwargs"
+    if start_marker not in src:
+        raise RuntimeError(
+            "_build_search_kwargs helper missing from "
+            "routers/learnai_compat.py — has the fix been reverted?"
         )
-        ns: dict = {}
-        exec(snippet, ns)  # noqa: S102 — controlled snippet, test-only.
-        return ns["_build_search_kwargs"]
-    return mod._build_search_kwargs
+    start = src.index(start_marker)
+    # Helper ends at the next top-level `def ` or `@router` directive.
+    end = len(src)
+    for marker in ("\n@router", "\ndef "):
+        idx = src.find(marker, start + len(start_marker))
+        if idx >= 0 and idx < end:
+            end = idx
+    snippet = "from typing import Any, Dict\n" + src[start:end]
+    ns: Dict[str, Any] = {}
+    exec(compile(snippet, src_path, "exec"), ns)  # noqa: S102 — controlled test snippet.
+    return ns["_build_search_kwargs"]
 
 
-_build = _load_helper()
+_build = _extract_helper()
 
 
 def test_user_id_is_promoted_into_filters():
