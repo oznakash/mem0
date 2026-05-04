@@ -15,6 +15,7 @@ from auth import (
     dummy_verify_password,
     hash_password,
     require_auth,
+    verify_auth,
     verify_password,
 )
 from db import get_db
@@ -210,3 +211,72 @@ def onboarding_complete(body: OnboardingCompleteRequest, user: User = Depends(re
     """Fire the one-shot telemetry event after the setup wizard reaches its success state."""
     capture_onboarding_completed(email=user.email, use_case=body.use_case)
     return MessageResponse(message="Onboarding completed.")
+
+
+# -- Admin: list auth users --------------------------------------------------
+#
+# Why this exists. The LearnAI cross-service entity-wiring audit
+# (see `LearnAI/docs/entity-wiring-audit.md`) needs to deterministically
+# reconcile mem0's `auth.users` table against social-svc's profile
+# table. The existing `/v1/state/admin/users` endpoint surfaces
+# `user_state` rows (xp/streak/etc.) but NOT the `name` field that
+# lives on `auth.users`. Without it, the social-svc reconcile fills
+# every backfilled profile's `displayName` with the title-cased
+# handle ("Danshtr") instead of the user's actual Google name
+# ("Dan Shtreichman"). This endpoint closes that gap.
+#
+# Privacy: admin-only (same gate as the rest of the /v1/state/admin
+# surface). Returns email + name + role + created/last-login. No
+# picture, no password info, no telemetry.
+
+
+class AdminUserSummary(BaseModel):
+    email: str
+    name: str
+    role: str
+    created_at: datetime
+    last_login_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class AdminAuthUsersResponse(BaseModel):
+    count: int
+    users: list[AdminUserSummary]
+
+
+def _require_admin_or_admin_email(request: Request) -> None:
+    """Dual gate: admin_api_key OR a Google session JWT with `is_admin=true`.
+    Mirrors `_require_admin` in `routers/user_state.py` so all admin surfaces
+    accept the same set of credentials. Inlined here to avoid creating a
+    new shared module just for one helper."""
+    auth_type = getattr(request.state, "auth_type", "none")
+    session_user = getattr(request.state, "session_user", None) or {}
+    is_admin = (
+        auth_type == "admin_api_key"
+        or (auth_type == "google_session" and bool(session_user.get("is_admin")))
+    )
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="admin only")
+
+
+@router.get(
+    "/admin/users",
+    response_model=AdminAuthUsersResponse,
+    summary="List auth.users rows (admin-only)",
+)
+def list_auth_users(
+    request: Request,
+    _auth=Depends(verify_auth),
+    db: Session = Depends(get_db),
+):
+    _require_admin_or_admin_email(request)
+    rows = (
+        db.execute(select(User).order_by(User.created_at.asc()))
+        .scalars()
+        .all()
+    )
+    return AdminAuthUsersResponse(
+        count=len(rows),
+        users=[AdminUserSummary.model_validate(r) for r in rows],
+    )
