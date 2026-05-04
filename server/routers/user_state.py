@@ -470,10 +470,18 @@ def admin_remove_user_cascade(
         steps["user_state"] = f"error: {exc}"
 
     # Step 2 — memories (vector store + history).
+    #
+    # NOTE: `Memory.delete_all()` and `Memory.search()` have inconsistent
+    # contracts in upstream mem0. `search()` rejects top-level entity
+    # kwargs and requires `filters={"user_id": ...}` (PR #20 in this
+    # repo handles that). `delete_all()` is the OPPOSITE — it takes
+    # `user_id=` directly and rejects `filters=`. The existing
+    # `v1_delete_all_memories` in `routers/learnai_compat.py:260` uses
+    # the top-level form. Match that.
     try:
         from server_state import get_memory_instance
 
-        get_memory_instance().delete_all(filters={"user_id": target})
+        get_memory_instance().delete_all(user_id=target)
         steps["memories"] = "deleted"
     except Exception as exc:
         steps["memories"] = f"error: {exc}"

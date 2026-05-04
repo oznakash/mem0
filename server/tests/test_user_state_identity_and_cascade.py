@@ -99,9 +99,14 @@ def test_cascade_endpoint_covers_all_stores():
     assert 'steps["memories"]' in cascade
     assert 'steps["auth_users"]' in cascade
     assert 'steps["social_svc"]' in cascade
-    # The memories delete uses the filters={user_id: ...} shape (not the
-    # legacy top-level kwarg — same /v1/memories/search bug from PR #20).
-    assert 'filters={"user_id": target}' in cascade
+    # The memories delete uses `user_id=target` directly. Don't be
+    # fooled by the search() contract — Memory.delete_all() actually
+    # rejects `filters=` and takes the top-level kwarg. Mismatch in
+    # upstream mem0 we can't fix here; the existing
+    # `v1_delete_all_memories` in routers/learnai_compat.py matches
+    # this shape.
+    assert "delete_all(user_id=target)" in cascade
+    assert 'filters={"user_id": target}' not in cascade
 
 
 def test_cascade_endpoint_idempotent_on_missing_rows():
