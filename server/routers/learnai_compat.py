@@ -165,23 +165,50 @@ def v1_list_memories(
         raise upstream_error()
 
 
+def _build_search_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate a `_SearchRequest`-shaped dict into the kwargs expected
+    by `Memory.search()`. Pure / no I/O so the contract is unit-testable
+    without FastAPI + SQLAlchemy + mem0's import chain.
+
+    Two non-trivial behaviors pinned here:
+
+    1. **`limit` → `top_k`.** The LearnAI client sends `limit`; mem0
+       expects `top_k`. Explicit `top_k` (if supplied) wins.
+    2. **Entity ids must live inside `filters={...}`.** Upstream mem0's
+       `_reject_top_level_entity_params` guard refuses `user_id`,
+       `run_id`, `agent_id` as top-level kwargs. Hoist them into
+       `filters` while preserving any client-supplied filter entries —
+       client filters win on key collision.
+    """
+    params = {
+        k: v
+        for k, v in payload.items()
+        if v is not None and k not in ("query", "limit")
+    }
+    limit = payload.get("limit")
+    if limit is not None and "top_k" not in params:
+        params["top_k"] = limit
+    entity_filters = {
+        k: params.pop(k)
+        for k in ("user_id", "run_id", "agent_id")
+        if k in params
+    }
+    if entity_filters:
+        existing = params.get("filters") or {}
+        params["filters"] = {**entity_filters, **existing}
+    return params
+
+
 @router.post("/v1/memories/search/", summary="Search memories (LearnAI compat)")
 def v1_search_memories(search_req: _SearchRequest, _auth=Depends(verify_auth)):
     """Semantic search.
 
-    LearnAI sends `limit`; mem0 expects `top_k`. Map one to the other so the
-    request actually paginates instead of falling through to mem0's default.
-    Explicit `top_k` (if supplied) wins over `limit`.
+    See `_build_search_kwargs` for the limit→top_k mapping and the
+    entity-id-hoisting behavior.
     """
     try:
-        params = {
-            k: v
-            for k, v in search_req.model_dump().items()
-            if v is not None and k not in ("query", "limit")
-        }
-        if search_req.limit is not None and "top_k" not in params:
-            params["top_k"] = search_req.limit
-        return get_memory_instance().search(query=search_req.query, **params)
+        kwargs = _build_search_kwargs(search_req.model_dump())
+        return get_memory_instance().search(query=search_req.query, **kwargs)
     except Exception:
         raise upstream_error()
 
