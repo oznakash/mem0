@@ -15,9 +15,16 @@ The Gmail-only restriction matches the SPA's existing policy. Admin status
 is read from the ADMIN_EMAILS env var (comma-separated allowlist).
 """
 
+import json
+import logging
 import os
+import threading
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
+import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -25,13 +32,92 @@ from auth import (
     ADMIN_API_KEY,
     ADMIN_EMAILS,
     GOOGLE_OAUTH_CLIENT_ID,
+    JWT_ALGORITHM,
     JWT_SECRET,
     SESSION_TTL_DAYS,
+    _get_secret,
     is_admin_email,
     issue_session_token,
     verify_auth,
     verify_google_id_token,
 )
+
+
+# Optional fan-out URL for the LearnAI social-svc sidecar. When set,
+# /auth/google fires a fire-and-forget upsert to social-svc on every
+# successful Google signin so the user's display profile (with full
+# name + picture from the Google identity) lands in social-svc
+# *immediately*, without depending on the SPA to make any subsequent
+# request. Closes the "mem0 has the user, social-svc doesn't" drift
+# observed in the LearnAI cross-service entity-wiring audit.
+#
+# Same-host setups (LearnAI's production container) leave this unset
+# and the upsert is skipped — mem0 and social-svc share that container
+# so the SPA's `ensureProfile` chain hits it on the same origin and
+# we don't need a cross-service ping. Multi-host / fork setups (where
+# mem0 lives at one URL and social-svc at another) set this so the
+# guarantee holds.
+SOCIAL_SVC_URL = (os.environ.get("SOCIAL_SVC_URL") or "").rstrip("/")
+_social_log = logging.getLogger("auth.social_fanout")
+
+
+def _mint_admin_session_for_social(email: str) -> str:
+    """Mint a short-lived session JWT with `is_admin=true` so social-svc's
+    admin-gate accepts the upsert. Re-uses the same JWT_SECRET that
+    social-svc verifies against (Platform Contract: shared secret per
+    cloud-claude project)."""
+    expire = datetime.now(timezone.utc) + timedelta(minutes=2)
+    payload = {
+        "sub": email,
+        "email": email,
+        "is_admin": True,
+        "exp": expire,
+        "type": "session",
+    }
+    return pyjwt.encode(payload, _get_secret(), algorithm=JWT_ALGORITHM)
+
+
+def _ping_social_svc_async(email: str, name: str | None, picture: str | None) -> None:
+    """Fire-and-forget POST to social-svc /v1/social/admin/profiles/upsert.
+    Idempotent on the receiving side. Runs on a background thread so
+    we never block the signin response on a slow network. Logs at INFO
+    on success, WARNING on failure — never raises into the request path.
+    """
+    if not SOCIAL_SVC_URL:
+        return  # same-host setup; skip.
+
+    def _post() -> None:
+        try:
+            tok = _mint_admin_session_for_social("auth-fanout@learnai")
+            payload = {"email": email}
+            if name:
+                payload["fullName"] = name
+            if picture:
+                payload["pictureUrl"] = picture
+            req = urllib.request.Request(
+                f"{SOCIAL_SVC_URL}/v1/social/admin/profiles/upsert",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {tok}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                code = resp.getcode()
+                _social_log.info(
+                    "social_fanout_ok",
+                    extra={"email_hash": (email or "")[:3], "status": code},
+                )
+        except urllib.error.HTTPError as exc:
+            _social_log.warning(
+                "social_fanout_failed",
+                extra={"email_hash": (email or "")[:3], "status": exc.code},
+            )
+        except Exception as exc:
+            _social_log.warning("social_fanout_exception", extra={"err": str(exc)})
+
+    threading.Thread(target=_post, daemon=True).start()
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -112,6 +198,12 @@ def sign_in_with_google(req: GoogleSignInRequest):
     token, expires_at = issue_session_token(
         email=email, name=name, picture=picture, is_admin=is_admin
     )
+
+    # Fire-and-forget upsert to social-svc with the Google identity so
+    # the display profile lands without depending on the SPA. See the
+    # comment block above `SOCIAL_SVC_URL` for the rationale + when
+    # this is a no-op (same-host setups). Never blocks the response.
+    _ping_social_svc_async(email=email, name=name, picture=picture)
 
     return GoogleSignInResponse(
         session=token,
