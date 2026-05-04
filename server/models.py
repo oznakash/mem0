@@ -83,6 +83,15 @@ class UserState(Base):
     the SPA decides its shape — so server-side schema changes don't
     require a coordinated client release. Size is loosely capped at
     256 KB by the router; bigger blobs are rejected with 413.
+
+    `display_name` and `picture_url` are mem0's persistent record of
+    the user's Google identity (name + avatar). Updated on every
+    `/auth/google` signin. Used by the reconcile path in
+    `LearnAI/services/social-svc` to backfill `fullName` + `pictureUrl`
+    on social-svc profiles so a user shows up correctly on the
+    leaderboard / public profile / Stream the moment their Google
+    identity is known to mem0 — no SPA dependency required. NULL when
+    the user signed up via password (not Google).
     """
 
     __tablename__ = "user_states"
@@ -90,6 +99,8 @@ class UserState(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=_new_uuid)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     blob: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    picture_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -27,6 +27,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from jose import jwt as jose_jwt
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from auth import (
     ADMIN_API_KEY,
@@ -41,6 +42,8 @@ from auth import (
     verify_auth,
     verify_google_id_token,
 )
+from db import get_db
+from routers.user_state import upsert_user_identity
 
 
 # Optional fan-out URL for the LearnAI social-svc sidecar. When set,
@@ -174,7 +177,7 @@ class GoogleSignInResponse(BaseModel):
 
 
 @router.post("/google", response_model=GoogleSignInResponse, summary="Sign in with a Google ID token")
-def sign_in_with_google(req: GoogleSignInRequest):
+def sign_in_with_google(req: GoogleSignInRequest, db: Session = Depends(get_db)):
     """Verify a Google-signed ID token, issue a session JWT.
 
     Restricted to @gmail.com addresses (matches the SPA's existing policy).
@@ -198,6 +201,12 @@ def sign_in_with_google(req: GoogleSignInRequest):
     token, expires_at = issue_session_token(
         email=email, name=name, picture=picture, is_admin=is_admin
     )
+
+    # Persist the Google name + avatar onto user_state so reconcile
+    # downstream (social-svc /admin/reconcile-from-mem0) can pick them
+    # up. Best-effort; failures are swallowed inside the helper. See
+    # `routers/user_state.py::upsert_user_identity`.
+    upsert_user_identity(db, email=email, name=name, picture_url=picture)
 
     # Fire-and-forget upsert to social-svc with the Google identity so
     # the display profile lands without depending on the SPA. See the
